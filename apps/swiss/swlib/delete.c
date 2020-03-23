@@ -98,11 +98,10 @@ Return Value:
     ULONG ArgumentLength;
     DIR *Directory;
     BOOL DirectoryEmpty;
-    struct dirent DirectoryEntry;
+    struct dirent *DirectoryEntry;
     BOOL InvalidArgument;
     PSTR QuotedArgument;
     INT Result;
-    struct dirent *ReturnedPointer;
     struct stat Stat;
     PSTR TypeString;
     PSTR WriteProtectedString;
@@ -183,7 +182,7 @@ Return Value:
         TypeString = "block device";
 
     } else if (S_ISCHR(Stat.st_mode)) {
-        TypeString = "charater device";
+        TypeString = "character device";
 
     } else if (S_ISDIR(Stat.st_mode)) {
         TypeString = "directory";
@@ -229,21 +228,20 @@ Return Value:
 
         DirectoryEmpty = TRUE;
         while (TRUE) {
-            Result = SwReadDirectory(Directory,
-                                     &DirectoryEntry,
-                                     &ReturnedPointer);
+            errno = 0;
+            DirectoryEntry = readdir(Directory);
+            if (DirectoryEntry == NULL) {
+                Result = errno;
+                if (Result != 0) {
+                    SwPrintError(Result, Argument, "Cannot read directory");
+                    goto RemoveEnd;
+                }
 
-            if (Result != 0) {
-                SwPrintError(Result, Argument, "Cannot read directory");
-                goto RemoveEnd;
-            }
-
-            if (ReturnedPointer == NULL) {
                 break;
             }
 
-            if ((strcmp(DirectoryEntry.d_name, ".") == 0) ||
-                (strcmp(DirectoryEntry.d_name, "..") == 0)) {
+            if ((strcmp(DirectoryEntry->d_name, ".") == 0) ||
+                (strcmp(DirectoryEntry->d_name, "..") == 0)) {
 
                 continue;
             }
@@ -281,14 +279,14 @@ Return Value:
         // The first entry is already primed.
         //
 
-        while (ReturnedPointer != NULL) {
-            if ((strcmp(DirectoryEntry.d_name, ".") != 0) &&
-                (strcmp(DirectoryEntry.d_name, "..") != 0)) {
+        while (DirectoryEntry != NULL) {
+            if ((strcmp(DirectoryEntry->d_name, ".") != 0) &&
+                (strcmp(DirectoryEntry->d_name, "..") != 0)) {
 
                 Result = SwAppendPath(Argument,
                                       strlen(Argument) + 1,
-                                      DirectoryEntry.d_name,
-                                      strlen(DirectoryEntry.d_name) + 1,
+                                      DirectoryEntry->d_name,
+                                      strlen(DirectoryEntry->d_name) + 1,
                                       &AppendedPath,
                                       &AppendedPathSize);
 
@@ -309,11 +307,10 @@ Return Value:
             // Move on to the next directory entry.
             //
 
-            Result = SwReadDirectory(Directory,
-                                     &DirectoryEntry,
-                                     &ReturnedPointer);
-
-            if (Result != 0) {
+            errno = 0;
+            DirectoryEntry = readdir(Directory);
+            Result = errno;
+            if ((DirectoryEntry == NULL) && (Result != 0)) {
                 SwPrintError(Result, Argument, "Cannot read directory");
                 goto RemoveEnd;
             }

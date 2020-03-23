@@ -32,6 +32,8 @@ Run `make` to build the OS for the particular architecture you've supplied. Para
 
 Object files are generated in `$SRCROOT/$ARCH$VARIANT$DEBUG/obj/os`. You can run `make clean`, or simply delete this directory, to cause the os repository to completely rebuild. Alternatively, you can run `make wipe` to delete all generated files, including the third-party tools you built or downloaded. Running `make wipe` simply deletes `$SRCROOT/$ARCH$VARIANT$DEBUG/`. We usually stick to `make clean` since `make wipe` requires a complete rebuild of the toolchain.
 
+A note for macOS users: We've managed to build successfully using both GCC from XCode 8 (really clang) and Homebrew GCC, both using the 10.12 SDK. Some users have reported that they need to export `SDKROOT=$(xcrun --show-sdk-path)` to build properly.
+
 ### Running
 To boot your built images, you can write the appropriate image for the platform you're trying to boot to a USB flash drive or hard disk. On Windows, you can use the Win32DiskImager tool (included in the [tools](https://gitlab.com/minoca/tools) repository under win32/Win32DiskImager). You can also use the msetup tool to build custom images. If you use the msetup tool to install Minoca OS onto a partition of a disk containing other partitions that you care about (such as on the same machine you're building from), we highly recommend making a complete backup of your disk. Minoca OS is still new, and we wouldn't want a bad bug to wipe out all your data.
 
@@ -68,10 +70,12 @@ Below is a brief orientation of a few of the directories in the repository. Chec
    * `usb` - USB support
      * `ehci` - EHCI host controller support
      * `usbcomp` - USB composite device support
+     * `usbhid` - USB HID support
      * `usbhub` - USB hub support
      * `usbkbd` - USB keyboard support
      * `usbmass` - USB mass storage support
-   * `usrinput` - User input device support
+     * `usbmouse` - USB mouse support
+   * `input` - User input drivers
    * `videocon` - Video terminal console driver
  * `images` - Recipes to create the final images for each supported platform
  * `include` - Public header files
@@ -106,7 +110,7 @@ Below is a brief orientation of a few of the directories in the repository. Chec
    * `tools` - Tools used in building final firmware images
 
 ## Contributing
-Submissions are welcome! See our [CONTRIBUTING.md](CONTRIBUTING.md) page for details, or our [WISHLIST.md](WISHLIST.md) page for suggestions. Bugs can be reported here on Github.
+Submissions are welcome! See our [CONTRIBUTING.md](CONTRIBUTING.md) page for details, or our [WISHLIST](docs/WISHLIST.md) page for suggestions. Bugs can be reported here on Github.
 
 ## License
 Minoca OS is licensed to the public under the terms of the GNU General Public License, version 3. Alternate licensing options are available. Contact info@minocacorp.com if your company is interested in licensing Minoca OS. For complete licensing information, see the [LICENSE](LICENSE) file in this repository.
@@ -118,3 +122,5 @@ Minoca OS is licensed to the public under the terms of the GNU General Public Li
  * Website: [http://www.minocacorp.com/](http://www.minocacorp.com)
  * Github: [https://github.com/minoca](https://github.com/minoca)
  * Gitlab: [https://gitlab.com/minoca](https://gitlab.com/minoca)
+ * IRC: [ircs://irc.oftc.net:6697/minoca-os](ircs://irc.oftc.net:6697/minoca-os)
+

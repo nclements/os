@@ -207,8 +207,7 @@ Return Value:
     BOOL DestinationExists;
     struct stat DestinationStat;
     DIR *Directory;
-    struct dirent DirectoryEntry;
-    struct dirent *DirectoryEntryPointer;
+    struct dirent *DirectoryEntry;
     BOOL FollowLinks;
     PSTR QuotedDestination;
     PSTR QuotedSource;
@@ -397,16 +396,15 @@ Return Value:
         }
 
         while (TRUE) {
-            Status = SwReadDirectory(Directory,
-                                     &DirectoryEntry,
-                                     &DirectoryEntryPointer);
+            errno = 0;
+            DirectoryEntry = readdir(Directory);
+            if (DirectoryEntry == NULL) {
+                Status = errno;
+                if (Status != 0) {
+                    SwPrintError(Status, Source, "Failed to read directory");
+                    goto CopyEnd;
+                }
 
-            if (Status != 0) {
-                SwPrintError(Status, Source, "Failed to read directory");
-                goto CopyEnd;
-            }
-
-            if (DirectoryEntryPointer == NULL) {
                 break;
             }
 
@@ -415,8 +413,8 @@ Return Value:
             // avoid unnecessary recursion.
             //
 
-            if ((strcmp(DirectoryEntry.d_name, ".") == 0) ||
-                (strcmp(DirectoryEntry.d_name, "..") == 0)) {
+            if ((strcmp(DirectoryEntry->d_name, ".") == 0) ||
+                (strcmp(DirectoryEntry->d_name, "..") == 0)) {
 
                 continue;
             }
@@ -427,8 +425,8 @@ Return Value:
 
             Status = SwAppendPath(Destination,
                                   strlen(Destination) + 1,
-                                  DirectoryEntry.d_name,
-                                  strlen(DirectoryEntry.d_name) + 1,
+                                  DirectoryEntry->d_name,
+                                  strlen(DirectoryEntry->d_name) + 1,
                                   &AppendedDestination,
                                   &AppendedDestinationSize);
 
@@ -440,8 +438,8 @@ Return Value:
 
             Status = SwAppendPath(Source,
                                   strlen(Source) + 1,
-                                  DirectoryEntry.d_name,
-                                  strlen(DirectoryEntry.d_name) + 1,
+                                  DirectoryEntry->d_name,
+                                  strlen(DirectoryEntry->d_name) + 1,
                                   &AppendedSource,
                                   &AppendedSourceSize);
 
@@ -660,7 +658,7 @@ Return Value:
         // Attempt to open and truncate the file.
         //
 
-        DestinationFile = open(Destination, O_WRONLY | O_TRUNC | O_BINARY);
+        DestinationFile = SwOpen(Destination, O_WRONLY | O_TRUNC | O_BINARY, 0);
         if (DestinationFile < 0) {
             if ((Options & COPY_OPTION_UNLINK) != 0) {
                 Result = SwUnlink(Destination);
@@ -691,9 +689,9 @@ Return Value:
             CreatePermissions |= S_IRWXU;
         }
 
-        DestinationFile = open(Destination,
-                               O_WRONLY | O_CREAT | O_BINARY,
-                               CreatePermissions);
+        DestinationFile = SwOpen(Destination,
+                                 O_WRONLY | O_CREAT | O_BINARY,
+                                 CreatePermissions);
 
         if (DestinationFile < 0) {
             Result = errno;
@@ -706,7 +704,7 @@ Return Value:
     // Open up the source as well.
     //
 
-    SourceFile = open(Source, O_RDONLY | O_BINARY);
+    SourceFile = SwOpen(Source, O_RDONLY | O_BINARY, 0);
     if (SourceFile < 0) {
         Result = errno;
         SwPrintError(Result, Destination, "Cannot open");
@@ -997,7 +995,6 @@ Return Value:
 
     Result = SwChangeFileOwner(Destination, FALSE, Stat->st_uid, Stat->st_gid);
     if (Result != 0) {
-        SwPrintError(Result, Destination, "Failed to change owner of");
 
         //
         // Change the permissions to clear the ISGID and ISUID bits.

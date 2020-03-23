@@ -221,6 +221,9 @@ Members:
 
     MaxTouched - Stores the maximum address that has been accessed.
 
+    MapFlags - Stores an additional bitmask of MAP_FLAG_* definitions to OR in
+        to any mappings of this section.
+
 --*/
 
 typedef struct _IMAGE_SECTION IMAGE_SECTION, *PIMAGE_SECTION;
@@ -246,6 +249,7 @@ struct _IMAGE_SECTION {
     UINTN ImageBackingReferenceCount;
     PVOID MinTouched;
     PVOID MaxTouched;
+    ULONG MapFlags;
 };
 
 /*++
@@ -263,7 +267,7 @@ Members:
         section to the virtual address corresponding to this physical page.
 
     LockCount - Stores the number of concurrent requests to lock the page in
-        memory. It is protected by the physical page lock.
+        memory.
 
     Flags - Stores a bitmask of flags for the paging entry. See
         PAGING_ENTRY_FLAG_* for definitions. This is only modified by the
@@ -279,7 +283,7 @@ typedef struct _PAGING_ENTRY {
     union {
         struct {
             UINTN SectionOffset;
-            USHORT LockCount;
+            volatile ULONG LockCount;
             USHORT Flags;
         };
 
@@ -302,7 +306,7 @@ extern UINTN MmTotalPhysicalPages;
 // Stores the number of allocated pages.
 //
 
-extern UINTN MmTotalAllocatedPhysicalPages;
+extern volatile UINTN MmTotalAllocatedPhysicalPages;
 
 //
 // Stores the the minimum number of free physical pages to be maintained by
@@ -322,7 +326,7 @@ extern PHYSICAL_ADDRESS MmMaximumPhysicalAddress;
 // Stores the lock protecting access to physical page data structures.
 //
 
-extern PQUEUED_LOCK MmPhysicalPageLock;
+extern PSHARED_EXCLUSIVE_LOCK MmPhysicalPageLock;
 
 //
 // Store a boolean indicating whether or not physical page zero is available.
@@ -402,7 +406,7 @@ KSTATUS
 MmpInitializePhysicalPageAllocator (
     PMEMORY_DESCRIPTOR_LIST MemoryMap,
     PVOID *InitMemory,
-    PULONG InitMemorySize
+    PUINTN InitMemorySize
     );
 
 /*++
@@ -459,9 +463,32 @@ Return Value:
 --*/
 
 PHYSICAL_ADDRESS
+MmpAllocatePhysicalPage (
+    VOID
+    );
+
+/*++
+
+Routine Description:
+
+    This routine allocates a single physical page of memory. All allocated
+    pages start out as non-paged and must be made pagable.
+
+Arguments:
+
+    None.
+
+Return Value:
+
+    Returns the physical address of the first page of allocated memory on
+    success, or INVALID_PHYSICAL_ADDRESS on failure.
+
+--*/
+
+PHYSICAL_ADDRESS
 MmpAllocatePhysicalPages (
-    ULONGLONG PageCount,
-    ULONGLONG Alignment
+    UINTN PageCount,
+    UINTN Alignment
     );
 
 /*++
@@ -470,14 +497,14 @@ Routine Description:
 
     This routine allocates a physical page of memory. If necessary, it will
     notify the system that free physical memory is low and wake up the page out
-    worker thread. All allocate pages start out as non-paged and must be
+    worker thread. All allocated pages start out as non-paged and must be
     made pagable.
 
 Arguments:
 
     PageCount - Supplies the number of consecutive physical pages required.
 
-    Alignment - Supplies the alignment requirement of the allocation, in bytes.
+    Alignment - Supplies the alignment requirement of the allocation, in pages.
         Valid values are powers of 2. Values of 1 or 0 indicate no alignment
         requirement.
 
@@ -490,8 +517,8 @@ Return Value:
 
 PHYSICAL_ADDRESS
 MmpAllocateIdentityMappablePhysicalPages (
-    ULONG PageCount,
-    ULONGLONG Alignment
+    UINTN PageCount,
+    UINTN Alignment
     );
 
 /*++
@@ -507,7 +534,7 @@ Arguments:
 
     PageCount - Supplies the number of consecutive physical pages required.
 
-    Alignment - Supplies the alignment requirement of the allocation, in bytes.
+    Alignment - Supplies the alignment requirement of the allocation, in pages.
         Valid values are powers of 2. Values of 1 or 0 indicate no alignment
         requirement.
 
@@ -518,10 +545,44 @@ Return Value:
 --*/
 
 KSTATUS
+MmpAllocateScatteredPhysicalPages (
+    PHYSICAL_ADDRESS MinPhysical,
+    PHYSICAL_ADDRESS MaxPhysical,
+    PPHYSICAL_ADDRESS Pages,
+    UINTN PageCount
+    );
+
+/*++
+
+Routine Description:
+
+    This routine allocates a set of any physical pages.
+
+Arguments:
+
+    MinPhysical - Supplies the minimum physical address for the allocations,
+        inclusive.
+
+    MaxPhysical - Supplies the maximum physical address to allocate, exclusive.
+
+    Pages - Supplies a pointer to an array where the physical addresses
+        allocated will be returned.
+
+    PageCount - Supplies the number of pages to allocate.
+
+Return Value:
+
+    STATUS_SUCCESS on success.
+
+    STATUS_NO_MEMORY on failure.
+
+--*/
+
+KSTATUS
 MmpEarlyAllocatePhysicalMemory (
     PMEMORY_DESCRIPTOR_LIST MemoryMap,
-    ULONG PageCount,
-    ULONGLONG Alignment,
+    UINTN PageCount,
+    UINTN Alignment,
     ALLOCATION_STRATEGY Strategy,
     PPHYSICAL_ADDRESS Allocation
     );
@@ -541,8 +602,9 @@ Arguments:
 
     PageCount - Supplies the number of physical pages needed.
 
-    Alignment - Supplies the required alignment of the physical pages. Valid
-        values are powers of 2. Supply 0 or 1 for no alignment requirement.
+    Alignment - Supplies the required alignment of the allocation, in pagse.
+        Valid values are powers of 2. Supply 0 or 1 for no alignment
+        requirement.
 
     Strategy - Supplies the memory allocation strategy to employ.
 
@@ -562,7 +624,7 @@ Return Value:
 VOID
 MmpEnablePagingOnPhysicalAddress (
     PHYSICAL_ADDRESS PhysicalAddress,
-    ULONG PageCount,
+    UINTN PageCount,
     PPAGING_ENTRY *PagingEntries,
     BOOL LockPages
     );
@@ -597,7 +659,7 @@ Return Value:
 KSTATUS
 MmpLockPhysicalPages (
     PHYSICAL_ADDRESS PhysicalAddress,
-    ULONG PageCount
+    UINTN PageCount
     );
 
 /*++
@@ -622,7 +684,7 @@ Return Value:
 VOID
 MmpUnlockPhysicalPages (
     PHYSICAL_ADDRESS PhysicalAddress,
-    ULONG PageCount
+    UINTN PageCount
     );
 
 /*++
@@ -701,9 +763,9 @@ Return Value:
 
 --*/
 
-ULONGLONG
+UINTN
 MmpPageOutPhysicalPages (
-    ULONGLONG FreePagesTarget,
+    UINTN FreePagesTarget,
     PIO_BUFFER IoBuffer,
     PMEMORY_RESERVATION SwapRegion
     );
@@ -1102,6 +1164,32 @@ Arguments:
     VirtualAddress - Supplies the starting virtual address of the memory range.
 
     Size - Supplies the size of the virtual address region, in bytes.
+
+Return Value:
+
+    None.
+
+--*/
+
+VOID
+MmpTearDownPageTables (
+    PADDRESS_SPACE AddressSpace,
+    BOOL Terminated
+    );
+
+/*++
+
+Routine Description:
+
+    This routine tears down all the page tables for the given address space
+    in user mode while the process is still live (but exiting).
+
+Arguments:
+
+    AddressSpace - Supplies a pointer to the address space being torn down.
+
+    Terminated - Supplies a boolean indicating whether the process is being
+        terminated or just exec'ed.
 
 Return Value:
 
@@ -2169,11 +2257,11 @@ KSTATUS
 MmpPageOut (
     PPAGING_ENTRY PagingEntry,
     PIMAGE_SECTION Section,
-    UINTN SectionOffset,
+    UINTN PageOffset,
     PHYSICAL_ADDRESS PhysicalAddress,
     PIO_BUFFER IoBuffer,
     PMEMORY_RESERVATION SwapRegion,
-    PULONGLONG PagesPaged
+    PUINTN PagesPaged
     );
 
 /*++
@@ -2191,9 +2279,9 @@ Arguments:
     Section - Supplies a pointer to the image section, snapped from the paging
         entry while the physical page lock was still held.
 
-    SectionOffset - Supplies the offset into the section in pages where this
-        page resides, snapped form the paging entry while the physical page
-        lock was still held.
+    PageOffset - Supplies the offset into the section in pages where this page
+        resides, snapped form the paging entry while the physical page lock was
+        still held.
 
     PhysicalAddress - Supplies the address of the physical page to swap out.
 

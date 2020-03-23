@@ -183,7 +183,7 @@ typedef struct _PHYSICAL_MEMORY_SEGMENT {
     LIST_ENTRY ListEntry;
     PHYSICAL_ADDRESS StartAddress;
     PHYSICAL_ADDRESS EndAddress;
-    ULONGLONG FreePages;
+    volatile UINTN FreePages;
 } PHYSICAL_MEMORY_SEGMENT, *PPHYSICAL_MEMORY_SEGMENT;
 
 /*++
@@ -219,8 +219,8 @@ typedef struct _INIT_PHYSICAL_MEMORY_ITERATOR {
     PHYSICAL_ADDRESS LastEnd;
     PPHYSICAL_PAGE CurrentPage;
     PPHYSICAL_MEMORY_SEGMENT CurrentSegment;
-    ULONGLONG PagesInitialized;
-    ULONGLONG TotalMemoryPages;
+    UINTN PagesInitialized;
+    UINTN TotalMemoryPages;
 } INIT_PHYSICAL_MEMORY_ITERATOR, *PINIT_PHYSICAL_MEMORY_ITERATOR;
 
 //
@@ -229,11 +229,11 @@ typedef struct _INIT_PHYSICAL_MEMORY_ITERATOR {
 
 PPHYSICAL_MEMORY_SEGMENT
 MmpFindPhysicalPages (
-    ULONGLONG PageCount,
-    ULONGLONG PageAlignment,
+    UINTN PageCount,
+    UINTN PageAlignment,
     PHYSICAL_MEMORY_SEARCH_TYPE SearchType,
-    PULONGLONG SelectedPageOffset,
-    PULONGLONG PagesFound
+    PUINTN SelectedPageOffset,
+    PUINTN PagesFound
     );
 
 VOID
@@ -245,8 +245,14 @@ MmpInitializePhysicalAllocatorIterationRoutine (
 
 BOOL
 MmpUpdatePhysicalMemoryStatistics (
-    ULONGLONG PageCount,
+    UINTN PageCount,
     BOOL Allocation
+    );
+
+VOID
+MmpWaitForFreePhysicalPages (
+    UINTN PageCount,
+    PULONGLONG Timeout
     );
 
 //
@@ -270,7 +276,7 @@ UINTN MmTotalPhysicalPages;
 // Stores the number of allocated pages.
 //
 
-UINTN MmTotalAllocatedPhysicalPages;
+volatile UINTN MmTotalAllocatedPhysicalPages;
 
 //
 // Stores the minimum number of free physical pages to be maintained by the
@@ -283,7 +289,7 @@ UINTN MmMinimumFreePhysicalPages;
 // Stores the number of non-paged physical pages.
 //
 
-UINTN MmNonPagedPhysicalPages;
+volatile UINTN MmNonPagedPhysicalPages;
 
 //
 // Store the maximum physical address that can be reached. This should be
@@ -294,7 +300,8 @@ PHYSICAL_ADDRESS MmMaximumPhysicalAddress = 0x100000000ULL;
 
 //
 // Store the last pages allocated, so that in general allocating pages sweeps
-// across memory instead of always picking the same pages.
+// across memory instead of always picking the same pages. Note that these are
+// unsynchronized, so the offsety may point way off the segment.
 //
 
 PPHYSICAL_MEMORY_SEGMENT MmLastAllocatedSegment;
@@ -306,13 +313,13 @@ UINTN MmLastAllocatedSegmentOffset;
 //
 
 PPHYSICAL_MEMORY_SEGMENT MmLastPagedSegment;
-ULONGLONG MmLastPagedSegmentOffset;
+UINTN MmLastPagedSegmentOffset;
 
 //
 // Stores the lock protecting access to physical page data structures.
 //
 
-PQUEUED_LOCK MmPhysicalPageLock = NULL;
+PSHARED_EXCLUSIVE_LOCK MmPhysicalPageLock = NULL;
 
 //
 // Store the lowest physical page to use.
@@ -343,10 +350,10 @@ MEMORY_WARNING_LEVEL MmPhysicalMemoryWarningLevel;
 // Store the number physical pages for each warning level's threshold.
 //
 
-ULONGLONG MmPhysicalMemoryWarningLevel1HighPages;
-ULONGLONG MmPhysicalMemoryWarningLevel1LowPages;
-ULONGLONG MmPhysicalMemoryWarningLevel2HighPages;
-ULONGLONG MmPhysicalMemoryWarningLevel2LowPages;
+UINTN MmPhysicalMemoryWarningLevel1HighPages;
+UINTN MmPhysicalMemoryWarningLevel1LowPages;
+UINTN MmPhysicalMemoryWarningLevel2HighPages;
+UINTN MmPhysicalMemoryWarningLevel2LowPages;
 
 //
 // Store the mask that determines how often physical warning levels are checked.
@@ -485,7 +492,7 @@ Return Value:
 VOID
 MmFreePhysicalPages (
     PHYSICAL_ADDRESS PhysicalAddress,
-    ULONGLONG PageCount
+    UINTN PageCount
     )
 
 /*++
@@ -510,25 +517,27 @@ Return Value:
 {
 
     PLIST_ENTRY CurrentEntry;
-    ULONGLONG Index;
-    ULONGLONG Offset;
+    UINTN Index;
+    UINTN NonPagedCount;
+    UINTN Offset;
     ULONG PageShift;
     PPAGING_ENTRY PagingEntry;
     LIST_ENTRY PagingEntryList;
     PPHYSICAL_PAGE PhysicalPage;
-    ULONGLONG ReleasedCount;
+    UINTN ReleasedCount;
     PPHYSICAL_MEMORY_SEGMENT Segment;
     BOOL SignalEvent;
 
     ASSERT(KeGetRunLevel() == RunLevelLow);
 
+    NonPagedCount = 0;
     PageShift = MmPageShift();
     PagingEntry = NULL;
     INITIALIZE_LIST_HEAD(&PagingEntryList);
     ReleasedCount = 0;
     SignalEvent = FALSE;
     if (MmPhysicalPageLock != NULL) {
-        KeAcquireQueuedLock(MmPhysicalPageLock);
+        KeAcquireSharedExclusiveLockShared(MmPhysicalPageLock);
     }
 
     CurrentEntry = MmPhysicalSegmentListHead.Next;
@@ -570,7 +579,7 @@ Return Value:
 
             if ((PhysicalPage->U.Flags & PHYSICAL_PAGE_FLAG_NON_PAGED) != 0) {
                 PhysicalPage->U.Free = PHYSICAL_PAGE_FREE;
-                MmNonPagedPhysicalPages -= 1;
+                NonPagedCount += 1;
                 ReleasedCount += 1;
 
             //
@@ -602,12 +611,14 @@ Return Value:
             PhysicalPage += 1;
         }
 
+        RtlAtomicAdd(&MmNonPagedPhysicalPages, -NonPagedCount);
+
         //
         // If any pages were set free, then update the appropriate metrics.
         //
 
         if (ReleasedCount != 0) {
-            Segment->FreePages += ReleasedCount;
+            RtlAtomicAdd(&(Segment->FreePages), ReleasedCount);
             SignalEvent = MmpUpdatePhysicalMemoryStatistics(ReleasedCount,
                                                             FALSE);
         }
@@ -635,7 +646,7 @@ Return Value:
 
 FreePhysicalPageEnd:
     if (MmPhysicalPageLock != NULL) {
-        KeReleaseQueuedLock(MmPhysicalPageLock);
+        KeReleaseSharedExclusiveLockShared(MmPhysicalPageLock);
     }
 
     while (LIST_EMPTY(&PagingEntryList) == FALSE) {
@@ -686,7 +697,7 @@ Return Value:
 {
 
     PLIST_ENTRY CurrentEntry;
-    ULONGLONG Offset;
+    UINTN Offset;
     ULONG PageShift;
     PPHYSICAL_PAGE PhysicalPage;
     PPHYSICAL_MEMORY_SEGMENT Segment;
@@ -695,7 +706,7 @@ Return Value:
 
     ASSERT(KeGetRunLevel() == RunLevelLow);
 
-    KeAcquireQueuedLock(MmPhysicalPageLock);
+    KeAcquireSharedExclusiveLockShared(MmPhysicalPageLock);
     CurrentEntry = MmPhysicalSegmentListHead.Next;
     while (CurrentEntry != &MmPhysicalSegmentListHead) {
         Segment = LIST_VALUE(CurrentEntry, PHYSICAL_MEMORY_SEGMENT, ListEntry);
@@ -732,7 +743,7 @@ Return Value:
     ASSERT(FALSE);
 
 SetPageCacheEntryForPhysicalAddressEnd:
-    KeReleaseQueuedLock(MmPhysicalPageLock);
+    KeReleaseSharedExclusiveLockShared(MmPhysicalPageLock);
     return;
 }
 
@@ -740,7 +751,7 @@ KSTATUS
 MmpInitializePhysicalPageAllocator (
     PMEMORY_DESCRIPTOR_LIST MemoryMap,
     PVOID *InitMemory,
-    PULONG InitMemorySize
+    PUINTN InitMemorySize
     )
 
 /*++
@@ -776,7 +787,7 @@ Return Value:
 
 {
 
-    ULONG AllocationSize;
+    UINTN AllocationSize;
     INIT_PHYSICAL_MEMORY_ITERATOR Context;
     UINTN Count;
     ULONG LastBitIndex;
@@ -803,7 +814,9 @@ Return Value:
     // Allocate space for the memory structures.
     //
 
-    Context.TotalMemoryPages = Context.TotalMemoryBytes >> PageShift;
+    ASSERT((Context.TotalMemoryBytes >> PageShift) <= MAX_UINTN);
+
+    Context.TotalMemoryPages = (UINTN)(Context.TotalMemoryBytes >> PageShift);
     if ((MmLimitTotalPhysicalPages != 0) &&
         (Context.TotalMemoryPages > MmLimitTotalPhysicalPages)) {
 
@@ -925,9 +938,178 @@ Return Value:
 }
 
 PHYSICAL_ADDRESS
+MmpAllocatePhysicalPage (
+    VOID
+    )
+
+/*++
+
+Routine Description:
+
+    This routine allocates a single physical page of memory. All allocated
+    pages start out as non-paged and must be made pagable.
+
+Arguments:
+
+    None.
+
+Return Value:
+
+    Returns the physical address of the first page of allocated memory on
+    success, or INVALID_PHYSICAL_ADDRESS on failure.
+
+--*/
+
+{
+
+    PHYSICAL_ADDRESS Allocation;
+    BOOL FirstIteration;
+    PPHYSICAL_MEMORY_SEGMENT LastSegment;
+    UINTN LastSegmentOffset;
+    UINTN Offset;
+    UINTN PageShift;
+    PPHYSICAL_PAGE PhysicalPage;
+    UINTN Previous;
+    PPHYSICAL_MEMORY_SEGMENT Segment;
+    UINTN SegmentPageCount;
+    BOOL SignalEvent;
+    ULONGLONG Timeout;
+
+    ASSERT(KeGetRunLevel() == RunLevelLow);
+
+    PageShift = MmPageShift();
+    SignalEvent = FALSE;
+
+    //
+    // Loop continuously looking for free pages.
+    //
+
+    Timeout = 0;
+    while (TRUE) {
+        if (MmPhysicalPageLock != NULL) {
+            KeAcquireSharedExclusiveLockShared(MmPhysicalPageLock);
+        }
+
+        //
+        // Look directly for a single free physical page.
+        //
+
+        LastSegment = MmLastAllocatedSegment;
+        LastSegmentOffset = MmLastAllocatedSegmentOffset;
+        Offset = LastSegmentOffset;
+        Segment = LastSegment;
+        SegmentPageCount = (Segment->EndAddress - Segment->StartAddress) >>
+                           PageShift;
+
+        FirstIteration = TRUE;
+        do {
+
+            //
+            // Check to see if it's time to advance to the next segment, either
+            // due to walking off of this one or there not being enough space
+            // left.
+            //
+
+            if ((Offset >= SegmentPageCount) || (Segment->FreePages == 0)) {
+
+                //
+                // If this is the first segment searched, and the loop has been
+                // here before, then stop looking.
+                //
+
+                if ((Segment == LastSegment) && (FirstIteration == FALSE)) {
+                    break;
+                }
+
+                FirstIteration = FALSE;
+                if (Segment->ListEntry.Next == &MmPhysicalSegmentListHead) {
+                    Segment = LIST_VALUE(MmPhysicalSegmentListHead.Next,
+                                         PHYSICAL_MEMORY_SEGMENT,
+                                         ListEntry);
+
+                } else {
+                    Segment = LIST_VALUE(Segment->ListEntry.Next,
+                                         PHYSICAL_MEMORY_SEGMENT,
+                                         ListEntry);
+                }
+
+                //
+                // Determine the segment page count.
+                //
+
+                SegmentPageCount =
+                    (Segment->EndAddress - Segment->StartAddress) >> PageShift;
+
+                Offset = 0;
+
+                //
+                // Do all this checking again, as the next segment may be full.
+                //
+
+                continue;
+            }
+
+            PhysicalPage = (PPHYSICAL_PAGE)(Segment + 1);
+            PhysicalPage += Offset;
+            while (Offset < SegmentPageCount) {
+                if (PhysicalPage->U.Free == PHYSICAL_PAGE_FREE) {
+                    Previous = RtlAtomicCompareExchange(
+                                                  &(PhysicalPage->U.Flags),
+                                                  PHYSICAL_PAGE_FLAG_NON_PAGED,
+                                                  PHYSICAL_PAGE_FREE);
+
+                    if (Previous == PHYSICAL_PAGE_FREE) {
+                        MmLastAllocatedSegment = Segment;
+                        MmLastAllocatedSegmentOffset = Offset + 1;
+                        RtlAtomicAdd(&(Segment->FreePages), -1);
+                        SignalEvent = MmpUpdatePhysicalMemoryStatistics(1,
+                                                                        TRUE);
+
+                        Allocation = Segment->StartAddress +
+                                     (Offset << PageShift);
+
+                        goto AllocatePhysicalPageEnd;
+                    }
+                }
+
+                Offset += 1;
+                PhysicalPage += 1;
+            }
+
+        } while ((Segment != LastSegment) || (Offset != LastSegmentOffset));
+
+        if (MmPhysicalPageLock != NULL) {
+            KeReleaseSharedExclusiveLockShared(MmPhysicalPageLock);
+        }
+
+        MmpWaitForFreePhysicalPages(1, &Timeout);
+    }
+
+    Allocation = INVALID_PHYSICAL_ADDRESS;
+
+AllocatePhysicalPageEnd:
+    if (MmPhysicalPageLock != NULL) {
+        KeReleaseSharedExclusiveLockShared(MmPhysicalPageLock);
+    }
+
+    //
+    // Signal the physical memory change event if it was determined above.
+    //
+
+    if (SignalEvent != FALSE) {
+
+        ASSERT(MmPhysicalMemoryWarningEvent != NULL);
+
+        KeSignalEvent(MmPhysicalMemoryWarningEvent, SignalOptionPulse);
+    }
+
+    return Allocation;
+}
+
+PHYSICAL_ADDRESS
 MmpAllocatePhysicalPages (
-    ULONGLONG PageCount,
-    ULONGLONG Alignment
+    UINTN PageCount,
+    UINTN Alignment
     )
 
 /*++
@@ -936,14 +1118,14 @@ Routine Description:
 
     This routine allocates a physical page of memory. If necessary, it will
     notify the system that free physical memory is low and wake up the page out
-    worker thread. All allocate pages start out as non-paged and must be
+    worker thread. All allocated pages start out as non-paged and must be
     made pagable.
 
 Arguments:
 
     PageCount - Supplies the number of consecutive physical pages required.
 
-    Alignment - Supplies the alignment requirement of the allocation, in bytes.
+    Alignment - Supplies the alignment requirement of the allocation, in pages.
         Valid values are powers of 2. Values of 1 or 0 indicate no alignment
         requirement.
 
@@ -956,16 +1138,19 @@ Return Value:
 
 {
 
-    ULONGLONG FreePageTarget;
     BOOL LockHeld;
-    ULONGLONG PageIndex;
+    UINTN PageIndex;
     ULONG PageShift;
-    volatile PPHYSICAL_PAGE PhysicalPage;
+    PPHYSICAL_PAGE PhysicalPage;
     PPHYSICAL_MEMORY_SEGMENT Segment;
-    ULONGLONG SegmentOffset;
+    UINTN SegmentOffset;
     BOOL SignalEvent;
     ULONGLONG Timeout;
     PHYSICAL_ADDRESS WorkingAllocation;
+
+    if ((PageCount == 1) && (Alignment <= 1)) {
+        return MmpAllocatePhysicalPage();
+    }
 
     ASSERT(KeGetRunLevel() == RunLevelLow);
     ASSERT((MmPagingThread == NULL) ||
@@ -975,7 +1160,6 @@ Return Value:
     PageShift = MmPageShift();
     SignalEvent = FALSE;
     WorkingAllocation = INVALID_PHYSICAL_ADDRESS;
-    Alignment = Alignment >> PageShift;
     if (Alignment == 0) {
         Alignment = 1;
     }
@@ -987,7 +1171,7 @@ Return Value:
     Timeout = 0;
     while (TRUE) {
         if (MmPhysicalPageLock != NULL) {
-            KeAcquireQueuedLock(MmPhysicalPageLock);
+            KeAcquireSharedExclusiveLockExclusive(MmPhysicalPageLock);
             LockHeld = TRUE;
         }
 
@@ -1019,7 +1203,7 @@ Return Value:
                 PhysicalPage += 1;
             }
 
-            Segment->FreePages -= PageCount;
+            RtlAtomicAdd(&(Segment->FreePages), -PageCount);
             SignalEvent = MmpUpdatePhysicalMemoryStatistics(PageCount, TRUE);
             goto AllocatePhysicalPagesEnd;
         }
@@ -1029,53 +1213,17 @@ Return Value:
         // enough to hopefully satisfy the request.
         //
 
-        FreePageTarget = MmMinimumFreePhysicalPages;
-        if (FreePageTarget < PageCount + (Alignment >> PageShift)) {
-            FreePageTarget = PageCount + (Alignment >> PageShift);
-        }
-
         if (LockHeld != FALSE) {
-            KeReleaseQueuedLock(MmPhysicalPageLock);
+            KeReleaseSharedExclusiveLockExclusive(MmPhysicalPageLock);
             LockHeld = FALSE;
         }
 
-        //
-        // Not enough free memory could be found laying around. Schedule the
-        // paging worker to notify it that memory is a little tight. If it gets
-        // scheduled, wait for it to free some pages.
-        //
-
-        if (MmRequestPagingOut(FreePageTarget) != FALSE) {
-            KeWaitForEvent(MmPagingFreePagesEvent, FALSE, WAIT_TIME_INDEFINITE);
-        }
-
-        //
-        // If this is the first time around, set the timeout timer to decide
-        // when to give up.
-        //
-
-        if (Timeout == 0) {
-            Timeout = KeGetRecentTimeCounter() +
-                      (HlQueryTimeCounterFrequency() *
-                       PHYSICAL_MEMORY_ALLOCATION_TIMEOUT);
-
-        } else {
-
-            //
-            // If it's been quite awhile and still there is no free physical
-            // page, it's time to assume forward progress will never be made
-            // and throw in the towel.
-            //
-
-            if (KeGetRecentTimeCounter() >= Timeout) {
-                KeCrashSystem(CRASH_OUT_OF_MEMORY, PageCount, Alignment, 0, 0);
-            }
-        }
+        MmpWaitForFreePhysicalPages(PageCount + Alignment, &Timeout);
     }
 
 AllocatePhysicalPagesEnd:
     if (LockHeld != FALSE) {
-        KeReleaseQueuedLock(MmPhysicalPageLock);
+        KeReleaseSharedExclusiveLockExclusive(MmPhysicalPageLock);
     }
 
     //
@@ -1100,8 +1248,8 @@ AllocatePhysicalPagesEnd:
 
 PHYSICAL_ADDRESS
 MmpAllocateIdentityMappablePhysicalPages (
-    ULONG PageCount,
-    ULONGLONG Alignment
+    UINTN PageCount,
+    UINTN Alignment
     )
 
 /*++
@@ -1117,7 +1265,7 @@ Arguments:
 
     PageCount - Supplies the number of consecutive physical pages required.
 
-    Alignment - Supplies the alignment requirement of the allocation, in bytes.
+    Alignment - Supplies the alignment requirement of the allocation, in pages.
         Valid values are powers of 2. Values of 1 or 0 indicate no alignment
         requirement.
 
@@ -1129,22 +1277,21 @@ Return Value:
 
 {
 
-    ULONGLONG PageIndex;
+    UINTN PageIndex;
     ULONG PageShift;
     PPHYSICAL_PAGE PhysicalPage;
     PPHYSICAL_MEMORY_SEGMENT Segment;
-    ULONGLONG SegmentOffset;
+    UINTN SegmentOffset;
     PHYSICAL_ADDRESS WorkingAllocation;
 
     PageShift = MmPageShift();
     WorkingAllocation = INVALID_PHYSICAL_ADDRESS;
-    Alignment = Alignment >> PageShift;
     if (Alignment == 0) {
         Alignment = 1;
     }
 
     if (MmPhysicalPageLock != NULL) {
-        KeAcquireQueuedLock(MmPhysicalPageLock);
+        KeAcquireSharedExclusiveLockExclusive(MmPhysicalPageLock);
     }
 
     //
@@ -1169,9 +1316,9 @@ Return Value:
 
             ASSERT(PhysicalPage->U.Free == PHYSICAL_PAGE_FREE);
 
-            Segment->FreePages -= 1;
-            MmTotalAllocatedPhysicalPages += 1;
-            MmNonPagedPhysicalPages += 1;
+            RtlAtomicAdd(&(Segment->FreePages), -1);
+            RtlAtomicAdd(&MmTotalAllocatedPhysicalPages, 1);
+            RtlAtomicAdd(&MmNonPagedPhysicalPages, 1);
 
             ASSERT(MmTotalAllocatedPhysicalPages <= MmTotalPhysicalPages);
 
@@ -1181,17 +1328,204 @@ Return Value:
     }
 
     if (MmPhysicalPageLock != NULL) {
-        KeReleaseQueuedLock(MmPhysicalPageLock);
+        KeReleaseSharedExclusiveLockExclusive(MmPhysicalPageLock);
     }
 
     return WorkingAllocation;
 }
 
 KSTATUS
+MmpAllocateScatteredPhysicalPages (
+    PHYSICAL_ADDRESS MinPhysical,
+    PHYSICAL_ADDRESS MaxPhysical,
+    PPHYSICAL_ADDRESS Pages,
+    UINTN PageCount
+    )
+
+/*++
+
+Routine Description:
+
+    This routine allocates a set of any physical pages.
+
+Arguments:
+
+    MinPhysical - Supplies the minimum physical address for the allocations,
+        inclusive.
+
+    MaxPhysical - Supplies the maximum physical address to allocate, exclusive.
+
+    Pages - Supplies a pointer to an array where the physical addresses
+        allocated will be returned.
+
+    PageCount - Supplies the number of pages to allocate.
+
+Return Value:
+
+    STATUS_SUCCESS on success.
+
+    STATUS_NO_MEMORY on failure.
+
+--*/
+
+{
+
+    PHYSICAL_ADDRESS EndAddress;
+    UINTN EndOffset;
+    BOOL FirstIteration;
+    PPHYSICAL_MEMORY_SEGMENT LastSegment;
+    UINTN LastSegmentOffset;
+    UINTN Offset;
+    UINTN PageIndex;
+    ULONG PageShift;
+    PPHYSICAL_PAGE PhysicalPage;
+    PPHYSICAL_MEMORY_SEGMENT Segment;
+    BOOL SignalEvent;
+    PHYSICAL_ADDRESS StartAddress;
+
+    FirstIteration = TRUE;
+    PageShift = MmPageShift();
+
+    ASSERT(KeGetRunLevel() == RunLevelLow);
+
+    KeAcquireSharedExclusiveLockExclusive(MmPhysicalPageLock);
+    LastSegment = MmLastAllocatedSegment;
+    LastSegmentOffset = MmLastAllocatedSegmentOffset;
+    Segment = LastSegment;
+
+    //
+    // Adjust the offset to the min/max. If the segment is completely out of
+    // range, then the offset should end up at or beyond the end offset to
+    // trigger moving to the next segment.
+    //
+
+    EndAddress = Segment->EndAddress;
+    if (EndAddress > MaxPhysical) {
+        EndAddress = MaxPhysical;
+    }
+
+    StartAddress = Segment->StartAddress;
+    if (StartAddress < MinPhysical) {
+        StartAddress = MinPhysical;
+    }
+
+    EndOffset = 0;
+    if (EndAddress >= StartAddress) {
+        EndOffset = (EndAddress - Segment->StartAddress) >> PageShift;
+    }
+
+    Offset = LastSegmentOffset;
+    if (Segment->StartAddress + (Offset << PageShift) < StartAddress) {
+        Offset = (StartAddress - Segment->StartAddress) >> PageShift;
+    }
+
+    PageIndex = 0;
+    while (PageIndex < PageCount) {
+
+        //
+        // See if it's time to move to a new segment.
+        //
+
+        if ((Offset >= EndOffset) || (Segment->FreePages == 0)) {
+            if ((Segment == LastSegment) && (FirstIteration == FALSE)) {
+                break;
+            }
+
+            FirstIteration = FALSE;
+            if (Segment->ListEntry.Next == &MmPhysicalSegmentListHead) {
+                Segment = LIST_VALUE(MmPhysicalSegmentListHead.Next,
+                                     PHYSICAL_MEMORY_SEGMENT,
+                                     ListEntry);
+
+            } else {
+                Segment = LIST_VALUE(Segment->ListEntry.Next,
+                                     PHYSICAL_MEMORY_SEGMENT,
+                                     ListEntry);
+            }
+
+            EndAddress = Segment->EndAddress;
+            if (EndAddress > MaxPhysical) {
+                EndAddress = MaxPhysical;
+            }
+
+            Offset = 0;
+            StartAddress = Segment->StartAddress;
+            if (StartAddress < MinPhysical) {
+                StartAddress = MinPhysical;
+                Offset = (StartAddress - Segment->StartAddress) >> PageShift;
+            }
+
+            EndOffset = 0;
+            if (EndAddress >= StartAddress) {
+                EndOffset = (EndAddress - Segment->StartAddress) >> PageShift;
+            }
+        }
+
+        //
+        // Suck up all the pages in this segment.
+        //
+
+        PhysicalPage = (PPHYSICAL_PAGE)(Segment + 1);
+        while ((Offset < EndOffset) && (Segment->FreePages != 0)) {
+            if (PhysicalPage[Offset].U.Free == PHYSICAL_PAGE_FREE) {
+                PhysicalPage[Offset].U.Flags = PHYSICAL_PAGE_FLAG_NON_PAGED;
+                Pages[PageIndex] = Segment->StartAddress +
+                                   (Offset << PageShift);
+
+                ASSERT(Segment->FreePages != 0);
+
+                RtlAtomicAdd(&(Segment->FreePages), -1);
+                PageIndex += 1;
+                if (PageIndex == PageCount) {
+                    MmLastAllocatedSegment = Segment;
+                    MmLastAllocatedSegmentOffset = Offset;
+                    break;
+                }
+            }
+
+            Offset += 1;
+        }
+    }
+
+    SignalEvent = MmpUpdatePhysicalMemoryStatistics(PageCount, TRUE);
+    KeReleaseSharedExclusiveLockExclusive(MmPhysicalPageLock);
+    if (SignalEvent != FALSE) {
+        KeSignalEvent(MmPhysicalMemoryWarningEvent, SignalOptionPulse);
+    }
+
+    //
+    // Space seems to be limited, since not all spots were allocated and all of
+    // physical memory was traversed. Allocate the slow way, with delays and
+    // attempted page outs.
+    //
+
+    while (PageIndex < PageCount) {
+        Pages[PageIndex] = MmpAllocatePhysicalPage();
+        if (Pages[PageIndex] == INVALID_PHYSICAL_ADDRESS) {
+
+            //
+            // Ick. Free everything allocated so far and give up.
+            //
+
+            PageCount = PageIndex;
+            for (PageIndex = 0; PageIndex < PageCount; PageIndex += 1) {
+                MmFreePhysicalPage(Pages[PageIndex]);
+            }
+
+            return STATUS_NO_MEMORY;
+        }
+
+        PageIndex += 1;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+KSTATUS
 MmpEarlyAllocatePhysicalMemory (
     PMEMORY_DESCRIPTOR_LIST MemoryMap,
-    ULONG PageCount,
-    ULONGLONG Alignment,
+    UINTN PageCount,
+    UINTN Alignment,
     ALLOCATION_STRATEGY Strategy,
     PPHYSICAL_ADDRESS Allocation
     )
@@ -1211,8 +1545,9 @@ Arguments:
 
     PageCount - Supplies the number of physical pages needed.
 
-    Alignment - Supplies the required alignment of the physical pages. Valid
-        values are powers of 2. Supply 0 or 1 for no alignment requirement.
+    Alignment - Supplies the required alignment of the allocation, in pagse.
+        Valid values are powers of 2. Supply 0 or 1 for no alignment
+        requirement.
 
     Strategy - Supplies the memory allocation strategy to employ.
 
@@ -1231,11 +1566,11 @@ Return Value:
 
 {
 
-    ULONG PageSize;
+    ULONG PageShift;
     KSTATUS Status;
 
     *Allocation = INVALID_PHYSICAL_ADDRESS;
-    PageSize = MmPageSize();
+    PageShift = MmPageShift();
 
     //
     // This routine should not be used if the real physical allocator has been
@@ -1249,14 +1584,14 @@ Return Value:
         goto EarlyAllocatePhysicalMemoryEnd;
     }
 
-    if (Alignment < PageSize) {
-        Alignment = PageSize;
+    if (Alignment == 0) {
+        Alignment = 1;
     }
 
     Status = MmMdAllocateFromMdl(MemoryMap,
                                  Allocation,
-                                 PageCount << MmPageShift(),
-                                 Alignment,
+                                 PageCount << PageShift,
+                                 Alignment << PageShift,
                                  0,
                                  MAX_ULONGLONG,
                                  MemoryTypeMmStructures,
@@ -1273,7 +1608,7 @@ EarlyAllocatePhysicalMemoryEnd:
 VOID
 MmpEnablePagingOnPhysicalAddress (
     PHYSICAL_ADDRESS PhysicalAddress,
-    ULONG PageCount,
+    UINTN PageCount,
     PPAGING_ENTRY *PagingEntries,
     BOOL LockPages
     )
@@ -1308,8 +1643,8 @@ Return Value:
 {
 
     PLIST_ENTRY CurrentEntry;
-    ULONGLONG PageIndex;
-    ULONGLONG PageOffset;
+    UINTN PageIndex;
+    UINTN PageOffset;
     ULONG PageShift;
     ULONG PageSize;
     PPHYSICAL_PAGE PhysicalPage;
@@ -1321,7 +1656,7 @@ Return Value:
     ASSERT(IS_ALIGNED(PhysicalAddress, PageSize) != FALSE);
 
     if (MmPhysicalPageLock != NULL) {
-        KeAcquireQueuedLock(MmPhysicalPageLock);
+        KeAcquireSharedExclusiveLockShared(MmPhysicalPageLock);
     }
 
     CurrentEntry = MmPhysicalSegmentListHead.Next;
@@ -1361,13 +1696,10 @@ Return Value:
                     IMAGE_SECTION_DESTROYED) == 0);
 
             if (LockPages != FALSE) {
-
-                ASSERT(PhysicalPage->U.PagingEntry->U.LockCount == 0);
-
-                PhysicalPage->U.PagingEntry->U.LockCount = 1;
+                RtlAtomicAdd32(&(PhysicalPage->U.PagingEntry->U.LockCount), 1);
 
             } else {
-                MmNonPagedPhysicalPages -= 1;
+                RtlAtomicAdd(&MmNonPagedPhysicalPages, -1);
             }
 
             PhysicalPage += 1;
@@ -1377,7 +1709,7 @@ Return Value:
     }
 
     if (MmPhysicalPageLock != NULL) {
-        KeReleaseQueuedLock(MmPhysicalPageLock);
+        KeReleaseSharedExclusiveLockShared(MmPhysicalPageLock);
     }
 
     return;
@@ -1386,7 +1718,7 @@ Return Value:
 KSTATUS
 MmpLockPhysicalPages (
     PHYSICAL_ADDRESS PhysicalAddress,
-    ULONG PageCount
+    UINTN PageCount
     )
 
 /*++
@@ -1412,12 +1744,13 @@ Return Value:
 
     PLIST_ENTRY CurrentEntry;
     UINTN Flags;
-    ULONGLONG MaxOffset;
-    ULONGLONG Offset;
-    ULONG PageIndex;
+    UINTN MaxOffset;
+    UINTN Offset;
+    UINTN PageIndex;
     ULONG PageShift;
     PPAGING_ENTRY PagingEntry;
     PPHYSICAL_PAGE PhysicalPage;
+    ULONG PreviousLockCount;
     PPHYSICAL_MEMORY_SEGMENT Segment;
     KSTATUS Status;
 
@@ -1427,7 +1760,7 @@ Return Value:
     ASSERT(KeGetRunLevel() == RunLevelLow);
 
     if (MmPhysicalPageLock != NULL) {
-        KeAcquireQueuedLock(MmPhysicalPageLock);
+        KeAcquireSharedExclusiveLockShared(MmPhysicalPageLock);
     }
 
     //
@@ -1484,7 +1817,9 @@ Return Value:
             // Fail if too many callers have attempted to lock this page.
             //
 
-            if (PagingEntry->U.LockCount == MAX_PHYSICAL_PAGE_LOCK_COUNT) {
+            PreviousLockCount = RtlAtomicAdd32(&(PagingEntry->U.LockCount), 1);
+            if (PreviousLockCount >= MAX_PHYSICAL_PAGE_LOCK_COUNT) {
+                RtlAtomicAdd32(&(PagingEntry->U.LockCount), -1);
                 Status = STATUS_RESOURCE_IN_USE;
                 goto LockPhysicalPagesEnd;
             }
@@ -1494,11 +1829,9 @@ Return Value:
             // the non-paged physical page count.
             //
 
-            if (PagingEntry->U.LockCount == 0) {
-                MmNonPagedPhysicalPages += 1;
+            if (PreviousLockCount == 0) {
+                RtlAtomicAdd(&MmNonPagedPhysicalPages, 1);
             }
-
-            PagingEntry->U.LockCount += 1;
         }
 
         Status = STATUS_SUCCESS;
@@ -1516,7 +1849,7 @@ Return Value:
 
 LockPhysicalPagesEnd:
     if (MmPhysicalPageLock != NULL) {
-        KeReleaseQueuedLock(MmPhysicalPageLock);
+        KeReleaseSharedExclusiveLockShared(MmPhysicalPageLock);
     }
 
     //
@@ -1535,7 +1868,7 @@ LockPhysicalPagesEnd:
 VOID
 MmpUnlockPhysicalPages (
     PHYSICAL_ADDRESS PhysicalAddress,
-    ULONG PageCount
+    UINTN PageCount
     )
 
 /*++
@@ -1561,14 +1894,15 @@ Return Value:
 
     PLIST_ENTRY CurrentEntry;
     UINTN Flags;
-    ULONGLONG MaxOffset;
-    ULONGLONG Offset;
-    ULONG PageIndex;
+    UINTN MaxOffset;
+    UINTN Offset;
+    UINTN PageIndex;
     ULONG PageShift;
     PPAGING_ENTRY PagingEntry;
     LIST_ENTRY PagingEntryList;
     PPHYSICAL_PAGE PhysicalPage;
-    ULONGLONG ReleasedCount;
+    ULONG PreviousLockCount;
+    UINTN ReleasedCount;
     PPHYSICAL_MEMORY_SEGMENT Segment;
     BOOL SignalEvent;
 
@@ -1579,7 +1913,7 @@ Return Value:
 
     ASSERT(KeGetRunLevel() == RunLevelLow);
 
-    KeAcquireQueuedLock(MmPhysicalPageLock);
+    KeAcquireSharedExclusiveLockShared(MmPhysicalPageLock);
     CurrentEntry = MmPhysicalSegmentListHead.Next;
     while (CurrentEntry != &MmPhysicalSegmentListHead) {
         Segment = LIST_VALUE(CurrentEntry, PHYSICAL_MEMORY_SEGMENT, ListEntry);
@@ -1616,11 +1950,13 @@ Return Value:
             PagingEntry = PhysicalPage[PageIndex].U.PagingEntry;
 
             ASSERT(PagingEntry != NULL);
-            ASSERT(PagingEntry->U.LockCount != 0);
 
-            PagingEntry->U.LockCount -= 1;
-            if (PagingEntry->U.LockCount == 0) {
-                MmNonPagedPhysicalPages -= 1;
+            PreviousLockCount = RtlAtomicAdd32(&(PagingEntry->U.LockCount), -1);
+
+            ASSERT(PreviousLockCount >= 1);
+
+            if (PreviousLockCount == 1) {
+                RtlAtomicAdd(&MmNonPagedPhysicalPages, -1);
                 if ((PagingEntry->U.Flags & PAGING_ENTRY_FLAG_FREED) != 0) {
                     PhysicalPage[PageIndex].U.Free = PHYSICAL_PAGE_FREE;
                     ReleasedCount += 1;
@@ -1631,7 +1967,7 @@ Return Value:
         }
 
         if (ReleasedCount != 0) {
-            Segment->FreePages += ReleasedCount;
+            RtlAtomicAdd(&(Segment->FreePages), ReleasedCount);
             SignalEvent = MmpUpdatePhysicalMemoryStatistics(ReleasedCount,
                                                             FALSE);
         }
@@ -1647,7 +1983,7 @@ Return Value:
     ASSERT(FALSE);
 
 UnlockPhysicalPageEnd:
-    KeReleaseQueuedLock(MmPhysicalPageLock);
+    KeReleaseSharedExclusiveLockShared(MmPhysicalPageLock);
     while (LIST_EMPTY(&PagingEntryList) == FALSE) {
         PagingEntry = LIST_VALUE(PagingEntryList.Next,
                                  PAGING_ENTRY,
@@ -1693,7 +2029,7 @@ Return Value:
 {
 
     PLIST_ENTRY CurrentEntry;
-    ULONGLONG Offset;
+    UINTN Offset;
     PPAGE_CACHE_ENTRY PageCacheEntry;
     ULONG PageShift;
     PPHYSICAL_PAGE PhysicalPage;
@@ -1704,7 +2040,7 @@ Return Value:
 
     ASSERT(KeGetRunLevel() == RunLevelLow);
 
-    KeAcquireQueuedLock(MmPhysicalPageLock);
+    KeAcquireSharedExclusiveLockShared(MmPhysicalPageLock);
     CurrentEntry = MmPhysicalSegmentListHead.Next;
     while (CurrentEntry != &MmPhysicalSegmentListHead) {
         Segment = LIST_VALUE(CurrentEntry, PHYSICAL_MEMORY_SEGMENT, ListEntry);
@@ -1743,7 +2079,7 @@ Return Value:
     ASSERT(FALSE);
 
 GetPageCacheEntryForPhysicalAddressEnd:
-    KeReleaseQueuedLock(MmPhysicalPageLock);
+    KeReleaseSharedExclusiveLockShared(MmPhysicalPageLock);
     return PageCacheEntry;
 }
 
@@ -1807,7 +2143,7 @@ Return Value:
     //
 
     Segment = NULL;
-    KeAcquireQueuedLock(MmPhysicalPageLock);
+    KeAcquireSharedExclusiveLockShared(MmPhysicalPageLock);
     for (PageIndex = 0; PageIndex < PageCount; PageIndex += 1) {
         PhysicalAddress = MmpVirtualToPhysical(Address, NULL);
         if (PhysicalAddress != INVALID_PHYSICAL_ADDRESS) {
@@ -1880,13 +2216,13 @@ Return Value:
         Address += PageSize;
     }
 
-    KeReleaseQueuedLock(MmPhysicalPageLock);
+    KeReleaseSharedExclusiveLockShared(MmPhysicalPageLock);
     return;
 }
 
-ULONGLONG
+UINTN
 MmpPageOutPhysicalPages (
-    ULONGLONG FreePagesTarget,
+    UINTN FreePagesTarget,
     PIO_BUFFER IoBuffer,
     PMEMORY_RESERVATION SwapRegion
     )
@@ -1918,21 +2254,21 @@ Return Value:
 
     BOOL Failure;
     ULONG FailureCount;
-    ULONGLONG FreePages;
+    UINTN FreePages;
     BOOL LockHeld;
-    ULONGLONG PageCountSinceEvent;
-    ULONGLONG PagesFound;
-    ULONGLONG PageShift;
-    ULONGLONG PagesPaged;
+    UINTN PageCountSinceEvent;
+    UINTN PagesFound;
+    ULONG PageShift;
+    UINTN PagesPaged;
     PPAGING_ENTRY PagingEntry;
     PHYSICAL_ADDRESS PhysicalAddress;
     PPHYSICAL_PAGE PhysicalPage;
     PIMAGE_SECTION Section;
     UINTN SectionOffset;
     PPHYSICAL_MEMORY_SEGMENT Segment;
-    ULONGLONG SegmentOffset;
+    UINTN SegmentOffset;
     KSTATUS Status;
-    ULONGLONG TotalPagesPaged;
+    UINTN TotalPagesPaged;
 
     LockHeld = FALSE;
     PageShift = MmPageShift();
@@ -1948,7 +2284,7 @@ Return Value:
     TotalPagesPaged = 0;
     while (TRUE) {
         if (MmPhysicalPageLock != NULL) {
-            KeAcquireQueuedLock(MmPhysicalPageLock);
+            KeAcquireSharedExclusiveLockExclusive(MmPhysicalPageLock);
             LockHeld = TRUE;
         }
 
@@ -2010,7 +2346,7 @@ Return Value:
         Section = PagingEntry->Section;
         SectionOffset = PagingEntry->U.SectionOffset;
         if (LockHeld != FALSE) {
-            KeReleaseQueuedLock(MmPhysicalPageLock);
+            KeReleaseSharedExclusiveLockExclusive(MmPhysicalPageLock);
             LockHeld = FALSE;
         }
 
@@ -2059,7 +2395,7 @@ Return Value:
     }
 
     if (LockHeld != FALSE) {
-        KeReleaseQueuedLock(MmPhysicalPageLock);
+        KeReleaseSharedExclusiveLockExclusive(MmPhysicalPageLock);
     }
 
     //
@@ -2079,11 +2415,11 @@ Return Value:
 
 PPHYSICAL_MEMORY_SEGMENT
 MmpFindPhysicalPages (
-    ULONGLONG PageCount,
-    ULONGLONG PageAlignment,
+    UINTN PageCount,
+    UINTN PageAlignment,
     PHYSICAL_MEMORY_SEARCH_TYPE SearchType,
-    PULONGLONG SelectedPageOffset,
-    PULONGLONG PagesFound
+    PUINTN SelectedPageOffset,
+    PUINTN PagesFound
     )
 
 /*++
@@ -2120,21 +2456,21 @@ Return Value:
 
 {
 
-    ULONGLONG AlignedSegmentStartPage;
+    UINTN AlignedSegmentStartPage;
     BOOL ExitCheck;
     BOOL FirstIteration;
-    ULONGLONG FirstOffset;
+    UINTN FirstOffset;
     UINTN Flags;
     PPHYSICAL_MEMORY_SEGMENT LastSegment;
-    ULONGLONG LastSegmentOffset;
-    ULONGLONG Offset;
+    UINTN LastSegmentOffset;
+    UINTN Offset;
     ULONG PageShift;
     PPAGING_ENTRY PagingEntry;
     PPHYSICAL_PAGE PhysicalPage;
     PPHYSICAL_MEMORY_SEGMENT Segment;
-    ULONGLONG SegmentPageCount;
-    ULONGLONG SpanCount;
-    ULONGLONG SpanPageCount;
+    UINTN SegmentPageCount;
+    UINTN SpanCount;
+    UINTN SpanPageCount;
     PVOID VirtualAddress;
     BOOL VirtualAddressInUse;
 
@@ -2145,7 +2481,7 @@ Return Value:
     //
 
     ASSERT((MmPhysicalPageLock == NULL) ||
-           (KeIsQueuedLockHeld(MmPhysicalPageLock) != FALSE));
+           (KeIsSharedExclusiveLockHeldExclusive(MmPhysicalPageLock) != FALSE));
 
     PageShift = MmPageShift();
     if (SearchType == PhysicalMemoryFindPagable) {
@@ -2460,12 +2796,12 @@ Return Value:
     BOOL FreePage;
     PHYSICAL_ADDRESS LowestPhysicalAddress;
     PINIT_PHYSICAL_MEMORY_ITERATOR MemoryContext;
-    ULONGLONG OutOfBoundsAllocatedPageCount;
-    ULONGLONG PageCount;
+    UINTN OutOfBoundsAllocatedPageCount;
+    UINTN PageCount;
     UINTN PageShift;
     UINTN PageSize;
     ULONGLONG TrimmedSize;
-    ULONGLONG TruncatePageCount;
+    UINTN TruncatePageCount;
 
     LowestPhysicalAddress = 0;
     MemoryContext = Context;
@@ -2528,6 +2864,8 @@ Return Value:
         if (!IS_MEMORY_FREE_TYPE(Descriptor->Type) &&
             !IS_BOOT_TEMPORARY_MEMORY_TYPE(Descriptor->Type)) {
 
+            ASSERT((Descriptor->Size >> PageShift) <= MAX_UINTN);
+
             OutOfBoundsAllocatedPageCount += Descriptor->Size >> PageShift;
         }
 
@@ -2589,6 +2927,8 @@ Return Value:
 
             if (!IS_MEMORY_FREE_TYPE(Descriptor->Type) &&
                 !IS_BOOT_TEMPORARY_MEMORY_TYPE(Descriptor->Type)) {
+
+                ASSERT((TrimmedSize >> PageShift) <= MAX_UINTN);
 
                 OutOfBoundsAllocatedPageCount += TrimmedSize >> PageShift;
             }
@@ -2654,7 +2994,10 @@ Return Value:
 
     if (MemoryContext->CurrentPage != NULL) {
         CurrentSegment = MemoryContext->CurrentSegment;
-        PageCount = Descriptor->Size >> PageShift;
+
+        ASSERT((Descriptor->Size >> PageShift) <= MAX_UINTN);
+
+        PageCount = (UINTN)(Descriptor->Size >> PageShift);
         FreePage = FALSE;
         if (IS_MEMORY_FREE_TYPE(Descriptor->Type)) {
             FreePage = TRUE;
@@ -2763,7 +3106,7 @@ InitializePhysicalAllocatorIterationRoutineEnd:
 
 BOOL
 MmpUpdatePhysicalMemoryStatistics (
-    ULONGLONG PageCount,
+    UINTN PageCount,
     BOOL Allocation
     )
 
@@ -2779,7 +3122,7 @@ Arguments:
     PageCount - Supplies the number of pages allocated or freed during the
         update period.
 
-    Allocation - Supplies a boolean indicating whether or not to upddate the
+    Allocation - Supplies a boolean indicating whether or not to update the
         statistics for an allocation (TRUE) or a free (FALSE).
 
 Return Value:
@@ -2792,13 +3135,16 @@ Return Value:
 {
 
     BOOL SignalEvent;
+    ULONGLONG Total;
 
     SignalEvent = FALSE;
     if (Allocation != FALSE) {
-        MmTotalAllocatedPhysicalPages += PageCount;
-        MmNonPagedPhysicalPages += PageCount;
+        Total = RtlAtomicAdd(&MmTotalAllocatedPhysicalPages, PageCount) +
+                PageCount;
 
-        ASSERT(MmTotalAllocatedPhysicalPages <= MmTotalPhysicalPages);
+        RtlAtomicAdd(&MmNonPagedPhysicalPages, PageCount);
+
+        ASSERT(Total <= MmTotalPhysicalPages);
 
         //
         // Periodically check to see if memory warnings should be signaled.
@@ -2814,16 +3160,14 @@ Return Value:
             //
 
             if ((MmPhysicalMemoryWarningLevel != MemoryWarningLevel1) &&
-                (MmTotalAllocatedPhysicalPages >=
-                 MmPhysicalMemoryWarningLevel1HighPages)) {
+                (Total >= MmPhysicalMemoryWarningLevel1HighPages)) {
 
                 MmPhysicalMemoryWarningLevel = MemoryWarningLevel1;
                 SignalEvent = TRUE;
 
             } else if ((MmPhysicalMemoryWarningLevel !=
                         MemoryWarningLevel2) &&
-                       (MmTotalAllocatedPhysicalPages >=
-                        MmPhysicalMemoryWarningLevel2HighPages)) {
+                       (Total >= MmPhysicalMemoryWarningLevel2HighPages)) {
 
                 MmPhysicalMemoryWarningLevel = MemoryWarningLevel2;
                 SignalEvent = TRUE;
@@ -2831,9 +3175,10 @@ Return Value:
         }
 
     } else {
-        MmTotalAllocatedPhysicalPages -= PageCount;
+        Total = RtlAtomicAdd(&MmTotalAllocatedPhysicalPages, -PageCount) -
+                PageCount;
 
-        ASSERT(MmTotalAllocatedPhysicalPages <= MmTotalPhysicalPages);
+        ASSERT(Total <= MmTotalPhysicalPages);
 
         //
         // Periodically check to see if memory warnings should be
@@ -2850,16 +3195,14 @@ Return Value:
             //
 
             if ((MmPhysicalMemoryWarningLevel == MemoryWarningLevel2) &&
-                (MmTotalAllocatedPhysicalPages <
-                 MmPhysicalMemoryWarningLevel2LowPages)) {
+                (Total < MmPhysicalMemoryWarningLevel2LowPages)) {
 
                 SignalEvent = TRUE;
                 MmPhysicalMemoryWarningLevel = MemoryWarningLevelNone;
 
             } else if ((MmPhysicalMemoryWarningLevel ==
                         MemoryWarningLevel1) &&
-                       (MmTotalAllocatedPhysicalPages <
-                        MmPhysicalMemoryWarningLevel1LowPages)) {
+                       (Total < MmPhysicalMemoryWarningLevel1LowPages)) {
 
                 SignalEvent = TRUE;
                 MmPhysicalMemoryWarningLevel = MemoryWarningLevel2;
@@ -2868,5 +3211,83 @@ Return Value:
     }
 
     return SignalEvent;
+}
+
+VOID
+MmpWaitForFreePhysicalPages (
+    UINTN PageCount,
+    PULONGLONG Timeout
+    )
+
+/*++
+
+Routine Description:
+
+    This routine is called when no physical memory could be allocated. It waits
+    for a certain amount of time, hoping memory will be freed up. If none was,
+    it takes the system down gracefully.
+
+Arguments:
+
+    PageCount - Supplies the number of free pages to wait for.
+
+    Timeout - Supplies a pointer to a timeout time counter value. Initially
+        this should be set to zero. It will be set to a timeout value that if
+        exceeded, causes the system to crash with an out of memory error.
+
+Return Value:
+
+    None. On failure or timeout, does not return.
+
+--*/
+
+{
+
+    UINTN FreePageTarget;
+
+    //
+    // Page out to try to get back to the minimum free count, or at least
+    // enough to hopefully satisfy the request.
+    //
+
+    FreePageTarget = MmMinimumFreePhysicalPages;
+    if (FreePageTarget < PageCount) {
+        FreePageTarget = PageCount;
+    }
+
+    //
+    // Not enough free memory could be found laying around. Schedule the
+    // paging worker to notify it that memory is a little tight. If it gets
+    // scheduled, wait for it to free some pages.
+    //
+
+    if (MmRequestPagingOut(FreePageTarget) != FALSE) {
+        KeWaitForEvent(MmPagingFreePagesEvent, FALSE, WAIT_TIME_INDEFINITE);
+    }
+
+    //
+    // If this is the first time around, set the timeout timer to decide
+    // when to give up.
+    //
+
+    if (*Timeout == 0) {
+        *Timeout = KeGetRecentTimeCounter() +
+                   (HlQueryTimeCounterFrequency() *
+                    PHYSICAL_MEMORY_ALLOCATION_TIMEOUT);
+
+    } else {
+
+        //
+        // If it's been quite awhile and still there is no free physical
+        // page, it's time to assume forward progress will never be made
+        // and throw in the towel.
+        //
+
+        if (KeGetRecentTimeCounter() >= *Timeout) {
+            KeCrashSystem(CRASH_OUT_OF_MEMORY, PageCount, 0, 0, 0);
+        }
+    }
+
+    return;
 }
 

@@ -382,11 +382,13 @@ Return Value:
     PSTR SecondSource;
     INT Status;
     BOOL SuppressFileName;
+    INT TotalStatus;
 
     memset(&Context, 0, sizeof(GREP_CONTEXT));
     INITIALIZE_LIST_HEAD(&(Context.InputList));
     INITIALIZE_LIST_HEAD(&(Context.PatternList));
     Status = 0;
+    TotalStatus = 0;
 
     //
     // Process the control arguments.
@@ -608,7 +610,7 @@ Return Value:
 
         Status = GrepAddInputFile(&Context, Argument, 0);
         if (Status != 0) {
-            goto MainEnd;
+            TotalStatus = Status;
         }
     }
 
@@ -630,6 +632,10 @@ Return Value:
     Status = GrepProcessInput(&Context);
 
 MainEnd:
+    if (TotalStatus != 0) {
+        Status = TotalStatus;
+    }
+
     while (LIST_EMPTY(&(Context.InputList)) == FALSE) {
         InputEntry = LIST_VALUE(Context.InputList.Next, GREP_INPUT, ListEntry);
         LIST_REMOVE(&(InputEntry->ListEntry));
@@ -822,7 +828,7 @@ Return Value:
         goto ReadFileInEnd;
     }
 
-    File = open(Path, O_RDONLY | O_BINARY);
+    File = SwOpen(Path, O_RDONLY | O_BINARY, 0);
     if (File < 0) {
         if ((Context->Options & GREP_OPTION_SUPPRESS_BLAND_ERRORS) != 0) {
             Status = 0;
@@ -1129,14 +1135,15 @@ Return Value:
     PSTR AppendedPath;
     ULONG AppendedPathSize;
     DIR *Directory;
-    struct dirent Entry;
-    struct dirent *EntryPointer;
+    struct dirent *Entry;
     PGREP_INPUT InputEntry;
     struct stat Stat;
     INT Status;
+    INT TotalStatus;
 
     Directory = NULL;
     InputEntry = NULL;
+    TotalStatus = 0;
     Status = SwStat(Path, TRUE, &Stat);
     if (Status != 0) {
         Status = errno;
@@ -1173,26 +1180,28 @@ Return Value:
         //
 
         while (TRUE) {
-            Status = SwReadDirectory(Directory, &Entry, &EntryPointer);
-            if (Status != 0) {
-                SwPrintError(Status, Path, "Unable to read directory");
-                goto AddInputFileEnd;
-            }
+            errno = 0;
+            Entry = readdir(Directory);
+            if (Entry == NULL) {
+                Status = errno;
+                if (Status != 0) {
+                    SwPrintError(Status, Path, "Unable to read directory");
+                    goto AddInputFileEnd;
+                }
 
-            if (EntryPointer == NULL) {
                 break;
             }
 
-            if ((strcmp(Entry.d_name, ".") == 0) ||
-                (strcmp(Entry.d_name, "..") == 0)) {
+            if ((strcmp(Entry->d_name, ".") == 0) ||
+                (strcmp(Entry->d_name, "..") == 0)) {
 
                 continue;
             }
 
             Status = SwAppendPath(Path,
                                   strlen(Path) + 1,
-                                  Entry.d_name,
-                                  strlen(Entry.d_name) + 1,
+                                  Entry->d_name,
+                                  strlen(Entry->d_name) + 1,
                                   &AppendedPath,
                                   &AppendedPathSize);
 
@@ -1207,7 +1216,7 @@ Return Value:
 
             free(AppendedPath);
             if (Status != 0) {
-                goto AddInputFileEnd;
+                TotalStatus = Status;
             }
         }
 
@@ -1239,6 +1248,10 @@ Return Value:
 AddInputFileEnd:
     if (Directory != NULL) {
         closedir(Directory);
+    }
+
+    if (TotalStatus != 0) {
+        Status = TotalStatus;
     }
 
     return Status;
@@ -1291,14 +1304,15 @@ Return Value:
         CurrentEntry = CurrentEntry->Next;
         FileOpened = FALSE;
         if (Input->File == NULL) {
-            Input->File = fopen(Input->FileName, "r");
+            Input->File = fopen(Input->FileName, "rb");
             if (Input->File == NULL) {
                 if ((Context->Options &
                      GREP_OPTION_SUPPRESS_BLAND_ERRORS) == 0) {
 
                     Status = errno;
                     SwPrintError(Status, Input->FileName, "Unable to open");
-                    goto ProcessInputEnd;
+                    TotalStatus = 2;
+                    continue;
                 }
             }
 
@@ -1325,7 +1339,6 @@ Return Value:
         }
     }
 
-ProcessInputEnd:
     if (LineBuffer != NULL) {
         free(LineBuffer);
     }
@@ -1608,6 +1621,14 @@ Return Value:
                 CharacterCount += 1;
             }
         }
+    }
+
+    //
+    // Kill a CR at the end of the line.
+    //
+
+    if ((CharacterCount != 0) && (String[CharacterCount - 1] == '\r')) {
+        CharacterCount -= 1;
     }
 
     String[CharacterCount] = '\0';

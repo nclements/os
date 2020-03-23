@@ -42,6 +42,12 @@ Author:
 
 #endif
 
+#if defined(__CYGWIN__)
+
+#define setdomainname(_Domainname, _Length) -1, errno = ENOSYS
+
+#endif
+
 //
 // ---------------------------------------------------------------- Definitions
 //
@@ -1090,39 +1096,6 @@ Arguments:
 Return Value:
 
     Returns the block size for this file.
-
---*/
-
-int
-SwReadDirectory (
-    DIR *Directory,
-    struct dirent *Buffer,
-    struct dirent **Result
-    );
-
-/*++
-
-Routine Description:
-
-    This routine reads from a directly, ideally in a reentrant manner.
-
-Arguments:
-
-    Directory - Supplies a pointer to the structure returned by the open
-        directory function.
-
-    Buffer - Supplies the buffer where the next directory entry will be
-        returned.
-
-    Result - Supplies a pointer that will either be set to the Buffer pointer
-        if there are more entries, or NULL if there are no more entries in the
-        directory.
-
-Return Value:
-
-    0 on success.
-
-    Returns an error number on failure.
 
 --*/
 
@@ -2653,6 +2626,39 @@ Return Value:
     Returns the number of processors on success.
 
     -1 on failure.
+
+--*/
+
+int
+SwOpen (
+    const char *Path,
+    int OpenFlags,
+    mode_t Mode
+    );
+
+/*++
+
+Routine Description:
+
+    This routine opens a file and connects it to a file descriptor.
+
+Arguments:
+
+    Shell - Supplies a pointer to the shell.
+
+    Path - Supplies a pointer to a null terminated string containing the path
+        of the file to open.
+
+    OpenFlags - Supplies a set of flags ORed together. See O_* definitions.
+
+    Mode - Supplies an optional integer representing the permission mask to set
+        if the file is to be created by this open call.
+
+Return Value:
+
+    Returns a file descriptor on success.
+
+    -1 on failure. The errno variable will be set to indicate the error.
 
 --*/
 

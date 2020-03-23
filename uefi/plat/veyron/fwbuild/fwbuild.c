@@ -86,6 +86,8 @@ Members:
 
 --*/
 
+#pragma pack(push, 1)
+
 typedef struct _VERIFIED_BOOT_SIGNATURE {
     ULONGLONG SignatureOffset;
     ULONGLONG SignatureSize;
@@ -134,6 +136,8 @@ typedef struct _VERIFIED_BOOT_PREAMBLE_HEADER {
     ULONGLONG BootLoaderSize;
     VERIFIED_BOOT_SIGNATURE ImageSignature;
 } PACKED VERIFIED_BOOT_PREAMBLE_HEADER, *PVERIFIED_BOOT_PREAMBLE_HEADER;
+
+#pragma pack(pop)
 
 //
 // ----------------------------------------------- Internal Function Prototypes
@@ -454,6 +458,10 @@ Return Value:
 mainEnd:
     if (FirmwareImage != NULL) {
         fclose(FirmwareImage);
+    }
+
+    if (KeyBlockFile != NULL) {
+        fclose(KeyBlockFile);
     }
 
     if (FirmwareImageBuffer != NULL) {

@@ -161,7 +161,21 @@ Return Value:
 
 {
 
-    return symlink(LinkTarget, Path);
+    INT Result;
+
+    //
+    // Create the symlink. If it already exists, attempt to unlink that file
+    // and create a new one.
+    //
+
+    Result = symlink(LinkTarget, Path);
+    if ((Result < 0) && (errno == EEXIST)) {
+        if (unlink(LinkTarget) == 0) {
+            Result = symlink(LinkTarget, Path);
+        }
+    }
+
+    return Result;
 }
 
 PVOID
@@ -207,9 +221,9 @@ Return Value:
     memset(IoHandle, 0, sizeof(SETUP_OS_HANDLE));
     IoHandle->Handle = INVALID_HANDLE;
     if (Destination->Path != NULL) {
-        IoHandle->Handle = (HANDLE)open(Destination->Path,
-                                        Flags,
-                                        CreatePermissions);
+        IoHandle->Handle = (HANDLE)(UINTN)open(Destination->Path,
+                                               Flags,
+                                               CreatePermissions);
 
         if (IoHandle->Handle == (HANDLE)-1) {
             free(IoHandle);
@@ -505,7 +519,7 @@ Return Value:
     struct stat Stat;
 
     IoHandle = Handle;
-    Result = fstat((int)(IoHandle->Handle), &Stat);
+    Result = fstat((int)(UINTN)(IoHandle->Handle), &Stat);
     if (Result != 0) {
         return Result;
     }
@@ -557,7 +571,7 @@ Return Value:
     int Result;
 
     IoHandle = Handle;
-    Result = ftruncate((int)(IoHandle->Handle), NewSize);
+    Result = ftruncate((int)(UINTN)(IoHandle->Handle), NewSize);
     if (Result != 0) {
         return Result;
     }
@@ -608,19 +622,12 @@ Return Value:
     PVOID NewBuffer;
     size_t NewCapacity;
     INT Result;
-    struct dirent *ResultPointer;
     size_t UsedSize;
 
     Array = NULL;
     ArrayCapacity = 0;
     Directory = NULL;
     UsedSize = 0;
-    DirectoryEntry = malloc(sizeof(struct dirent));
-    if (DirectoryEntry == NULL) {
-        Result = ENOMEM;
-        goto OsEnumerateDirectoryEnd;
-    }
-
     Directory = opendir(DirectoryPath);
     if (Directory == NULL) {
         Result = errno;
@@ -632,12 +639,14 @@ Return Value:
     //
 
     while (TRUE) {
-        Result = readdir_r(Directory, DirectoryEntry, &ResultPointer);
-        if (Result != 0) {
-            goto OsEnumerateDirectoryEnd;
-        }
+        errno = 0;
+        DirectoryEntry = readdir(Directory);
+        if (DirectoryEntry == NULL) {
+            if (errno != 0) {
+                Result = errno;
+                goto OsEnumerateDirectoryEnd;
+            }
 
-        if (ResultPointer == NULL) {
             NameSize = 1;
 
         } else {
@@ -678,7 +687,7 @@ Return Value:
         // Copy the entry (or an empty file if this is the end).
         //
 
-        if (ResultPointer == NULL) {
+        if (DirectoryEntry == NULL) {
             strcpy(Array + UsedSize, "");
             UsedSize += 1;
             break;
@@ -692,10 +701,6 @@ Return Value:
     Result = 0;
 
 OsEnumerateDirectoryEnd:
-    if (DirectoryEntry != NULL) {
-        free(DirectoryEntry);
-    }
-
     if (Directory != NULL) {
         closedir(Directory);
     }
